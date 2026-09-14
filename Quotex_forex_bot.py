@@ -8,24 +8,30 @@ import numpy as np
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# --- FIX DATABASE LOCKED ERROR ---
+# Render/Cloud এ SQLite ডাটাবেজ লক হওয়া বন্ধ করতে ক্যাশ লোকেশন পরিবর্তন
+try:
+    yf.set_tz_cache_location("/tmp/yf_tz")
+except Exception:
+    pass
+
 # =============================================
-# --- RENDER KEEP-ALIVE SERVER ---
+# --- RENDER KEEP-ALIVE WEB SERVER ---
 # =============================================
-class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"TB V22 Pro Confluence Tracker Online!")
-    def log_message(self, format, *args):
-        pass  # লগ বন্ধ
+        self.wfile.write(b"TB V23 Pro Candle Predictor Online & Fixed!")
+    def log_message(self, *a):
+        pass
 
-def run_web_server():
+def run_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
-    server.serve_forever()
+    HTTPServer(('0.0.0.0', port), Handler).serve_forever()
 
 # =============================================
-# --- CONFIGURATION ---
+# --- CONFIG ---
 # =============================================
 TOKEN = "8958179212:AAGRaqegMW4WJS9KTz1MwaU5lh5wtui4HQ0"
 GROUP_ID = "-1003927083951"
@@ -35,389 +41,350 @@ TICKERS = [
     "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "EURGBP=X", "USDCHF=X"
 ]
 
-MIN_CONFLUENCE = 3  # কমপক্ষে ৩টি স্ট্র্যাটেজি মিলতে হবে
+# 🔑 KEY SETTINGS — 5 মিনিটে ১-২টি High Quality Trade এর জন্য
+MIN_CONFLUENCE = 4    # ৫টির মধ্যে কমপক্ষে ৪টি মিলতে হবে
+COOLDOWN = 240        # ৪ মিনিট কুলডাউন
 
 last_signal_time = {}
 pending_results = []
 scoreboard = {"wins": 0, "losses": 0, "doji": 0}
 
 # =============================================
-# --- TELEGRAM SENDER ---
+# --- TELEGRAM ---
 # =============================================
-def send_telegram(text, reply_to=None):
+def send_tg(text, reply_to=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
-        "chat_id": GROUP_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": GROUP_ID, "text": text, "parse_mode": "Markdown"}
     if reply_to:
         payload["reply_to_message_id"] = reply_to
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code == 200:
             return r.json()["result"]["message_id"]
-        else:
-            print("TG Error:", r.status_code, r.text[:200])
-            return None
     except Exception as e:
-        print("Send Error:", e)
+        print("TG Send Error:", e)
+    return None
+
+# =============================================
+# --- SAFE DATA FETCHING (FIX 401 & LOCK) ---
+# =============================================
+def fetch_safe_data(ticker):
+    """Yahoo Block এড়াতে ১টি করে পেয়ার ফেচ করা"""
+    try:
+        df = yf.download(ticker, period="1d", interval="1m", progress=False)
+        if df.empty or len(df) < 20:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df
+    except Exception as e:
+        print(f"Fetch Error [{ticker}]: {e}")
         return None
 
 # =============================================
-# --- ৫টি প্রফেশনাল স্ট্র্যাটেজি ---
+# --- 5 PRO CANDLE STRATEGIES ---
 # =============================================
 
-def calc_rsi(closes, period=14):
-    """Strategy 1: RSI Reversal"""
-    if len(closes) < period + 1:
-        return None, ""
+def s1_consecutive_reversal(opens, closes):
+    if len(closes) < 4:
+        return "", ""
+    colors = ["G" if closes[i] > opens[i] else "R" if closes[i] < opens[i] else "D" for i in range(-4, 0)]
+
+    if colors[-1] == colors[-2] == colors[-3] == "G":
+        return "PUT", "3x Green Streak → Next Red 🔴"
+    elif colors[-1] == colors[-2] == colors[-3] == "R":
+        return "CALL", "3x Red Streak → Next Green 🟢"
+    return "", ""
+
+def s2_body_exhaustion(opens, closes):
+    if len(closes) < 12:
+        return "", ""
+    bodies = [abs(closes[i] - opens[i]) for i in range(-12, 0)]
+    avg_body = np.mean(bodies[:-1])
+    last_body = bodies[-1]
+    if avg_body == 0:
+        return "", ""
+
+    if last_body > avg_body * 2.3:
+        if closes[-1] > opens[-1]:
+            return "PUT", "Big Green Exhaustion → Next Red 🔴"
+        else:
+            return "CALL", "Big Red Exhaustion → Next Green 🟢"
+    return "", ""
+
+def s3_wick_rejection(opens, closes, highs, lows):
+    if len(opens) < 2:
+        return "", ""
+
+    def wick_ratio(o, c, h, l):
+        rng = h - l
+        if rng == 0:
+            return 0, 0
+        return (h - max(o, c)) / rng, (min(o, c) - l) / rng
+
+    u1, l1 = wick_ratio(opens[-2], closes[-2], highs[-2], lows[-2])
+    u2, l2 = wick_ratio(opens[-1], closes[-1], highs[-1], lows[-1])
+
+    if l1 > 0.40 and l2 > 0.40:
+        return "CALL", "Double Lower Wick Rejection → Next Green 🟢"
+    elif u1 > 0.40 and u2 > 0.40:
+        return "PUT", "Double Upper Wick Rejection → Next Red 🔴"
+    return "", ""
+
+def s4_rsi_extreme(closes, period=14):
+    if len(closes) < period + 2:
+        return "", ""
     deltas = np.diff(closes)
     gains = np.where(deltas > 0, deltas, 0)
     losses = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.mean(gains[-period:])
-    avg_loss = np.mean(losses[-period:])
-    if avg_loss == 0:
-        return 100, ""
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
+    ag = np.mean(gains[-period:])
+    al = np.mean(losses[-period:])
+    rsi = 100 if al == 0 else 100 - (100 / (1 + ag / al))
 
-    if rsi < 30:
-        return rsi, "CALL"
-    elif rsi > 70:
-        return rsi, "PUT"
-    return rsi, ""
+    if rsi < 28:
+        return "CALL", f"RSI({rsi:.0f}) Oversold → Next Green 🟢"
+    elif rsi > 72:
+        return "PUT", f"RSI({rsi:.0f}) Overbought → Next Red 🔴"
+    return "", ""
 
-def calc_ema_cross(closes):
-    """Strategy 2: EMA 9/21 Crossover"""
-    if len(closes) < 22:
-        return ""
-    ema9 = pd.Series(closes).ewm(span=9, adjust=False).mean()
-    ema21 = pd.Series(closes).ewm(span=21, adjust=False).mean()
+def s5_engulfing_reversal(opens, closes):
+    if len(opens) < 3:
+        return "", ""
 
-    # বর্তমান এবং আগের ক্রস চেক
-    curr_diff = ema9.iloc[-1] - ema21.iloc[-1]
-    prev_diff = ema9.iloc[-2] - ema21.iloc[-2]
+    p_o, p_c = opens[-2], closes[-2]
+    c_o, c_c = opens[-1], closes[-1]
+    p_body = abs(p_c - p_o)
+    c_body = abs(c_c - c_o)
 
-    if curr_diff > 0 and prev_diff <= 0:
-        return "CALL"  # Fresh bullish cross
-    elif curr_diff < 0 and prev_diff >= 0:
-        return "PUT"   # Fresh bearish cross
-    elif curr_diff > 0:
-        return "CALL_TREND"
-    elif curr_diff < 0:
-        return "PUT_TREND"
-    return ""
-
-def calc_bollinger(closes, period=20, std_dev=2):
-    """Strategy 3: Bollinger Band Bounce"""
-    if len(closes) < period:
-        return ""
-    sma = np.mean(closes[-period:])
-    std = np.std(closes[-period:])
-    upper = sma + (std * std_dev)
-    lower = sma - (std * std_dev)
-    current = closes[-1]
-    prev = closes[-2]
-
-    # প্রাইস Lower Band ছুঁয়ে উপরে উঠছে
-    if prev <= lower and current > lower:
-        return "CALL"
-    # প্রাইস Upper Band ছুঁয়ে নিচে নামছে
-    elif prev >= upper and current < upper:
-        return "PUT"
-    return ""
-
-def calc_engulfing(opens, closes):
-    """Strategy 4: Engulfing Candle Pattern"""
-    if len(opens) < 2 or len(closes) < 2:
-        return ""
-    prev_open, prev_close = opens[-2], closes[-2]
-    curr_open, curr_close = opens[-1], closes[-1]
-
-    prev_body = prev_close - prev_open
-    curr_body = curr_close - curr_open
-
-    # Bullish Engulfing: আগেরটা Red, বর্তমান Green এবং বড়
-    if prev_body < 0 and curr_body > 0 and curr_open <= prev_close and curr_close >= prev_open:
-        return "CALL"
-    # Bearish Engulfing: আগেরটা Green, বর্তমান Red এবং বড়
-    elif prev_body > 0 and curr_body < 0 and curr_open >= prev_close and curr_close <= prev_open:
-        return "PUT"
-    return ""
-
-def calc_pinbar(opens, closes, highs, lows):
-    """Strategy 5: Pin Bar / Hammer Reversal"""
-    if len(opens) < 1:
-        return ""
-    o, c, h, l = opens[-1], closes[-1], highs[-1], lows[-1]
-    body = abs(c - o)
-    rng = h - l
-    if rng == 0:
-        return ""
-
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
-
-    # Hammer (Bullish Pin Bar): Long lower wick, small body at top
-    if lower_wick > body * 2.5 and lower_wick > rng * 0.6 and upper_wick < body * 0.5:
-        return "CALL"
-    # Shooting Star (Bearish Pin Bar): Long upper wick, small body at bottom
-    elif upper_wick > body * 2.5 and upper_wick > rng * 0.6 and lower_wick < body * 0.5:
-        return "PUT"
-    return ""
+    if p_c < p_o and c_c > c_o and c_o <= p_c and c_c >= p_o and c_body > p_body * 1.1:
+        return "CALL", "Bullish Engulfing → Next Green 🟢"
+    elif p_c > p_o and c_c < c_o and c_o >= p_c and c_c <= p_o and c_body > p_body * 1.1:
+        return "PUT", "Bearish Engulfing → Next Red 🔴"
+    return "", ""
 
 # =============================================
 # --- MAIN ANALYSIS ENGINE ---
 # =============================================
-def analyze_and_signal():
+def analyze():
     try:
-        # বেশি ডাটা দরকার EMA/RSI এর জন্য
-        data = yf.download(TICKERS, period="5d", interval="1m", progress=False)
-        if data.empty:
-            return
-
         now = datetime.now()
-        next_min = (now.minute + 1) % 60
-        next_hour = now.hour if next_min != 0 else (now.hour + 1) % 24
-        next_time_str = f"{next_hour:02d}:{next_min:02d}:00"
+        nxt_m = (now.minute + 1) % 60
+        nxt_h = now.hour if nxt_m != 0 else (now.hour + 1) % 24
+        entry_time = f"{nxt_h:02d}:{nxt_m:02d}:00"
 
-        trade_start_ts = time.time() + (60 - now.second)
-        expiry_ts = trade_start_ts + 60
+        trade_start = time.time() + (60 - now.second)
+        expiry = trade_start + 60
 
         for ticker in TICKERS:
             try:
-                # ডাটা এক্সট্রাক্ট
-                if len(TICKERS) > 1 and isinstance(data.columns, pd.MultiIndex):
-                    closes = data["Close"][ticker].dropna().tolist()
-                    opens = data["Open"][ticker].dropna().tolist()
-                    highs = data["High"][ticker].dropna().tolist()
-                    lows = data["Low"][ticker].dropna().tolist()
-                else:
-                    closes = data["Close"].dropna().tolist()
-                    opens = data["Open"].dropna().tolist()
-                    highs = data["High"].dropna().tolist()
-                    lows = data["Low"].dropna().tolist()
-
-                if len(closes) < 25:
+                # 안전ভাবে প্রতি পেয়ারের ডাটা আনা
+                df = fetch_safe_data(ticker)
+                if df is None:
                     continue
 
-                # === ৫টি স্ট্র্যাটেজি রান ===
-                call_votes = 0
-                put_votes = 0
-                active_strategies = []
+                cl = df["Close"].dropna().tolist()
+                op = df["Open"].dropna().tolist()
+                hi = df["High"].dropna().tolist()
+                lo = df["Low"].dropna().tolist()
 
-                # 1. RSI
-                rsi_val, rsi_dir = calc_rsi(closes)
-                if rsi_dir == "CALL":
-                    call_votes += 1
-                    active_strategies.append(f"RSI({rsi_val:.0f}) Oversold")
-                elif rsi_dir == "PUT":
-                    put_votes += 1
-                    active_strategies.append(f"RSI({rsi_val:.0f}) Overbought")
+                if len(cl) < 20:
+                    continue
 
-                # 2. EMA Cross
-                ema_dir = calc_ema_cross(closes)
-                if ema_dir in ["CALL", "CALL_TREND"]:
-                    call_votes += 1
-                    active_strategies.append("EMA 9/21 Bullish")
-                elif ema_dir in ["PUT", "PUT_TREND"]:
-                    put_votes += 1
-                    active_strategies.append("EMA 9/21 Bearish")
+                call_v, put_v = 0, 0
+                reasons = []
 
-                # 3. Bollinger
-                bb_dir = calc_bollinger(closes)
-                if bb_dir == "CALL":
-                    call_votes += 1
-                    active_strategies.append("BB Lower Bounce")
-                elif bb_dir == "PUT":
-                    put_votes += 1
-                    active_strategies.append("BB Upper Reject")
+                # 1. Consecutive
+                d, r = s1_consecutive_reversal(op, cl)
+                if d == "CALL": call_v += 1; reasons.append(r)
+                elif d == "PUT": put_v += 1; reasons.append(r)
 
-                # 4. Engulfing
-                eng_dir = calc_engulfing(opens, closes)
-                if eng_dir == "CALL":
-                    call_votes += 1
-                    active_strategies.append("Bullish Engulfing")
-                elif eng_dir == "PUT":
-                    put_votes += 1
-                    active_strategies.append("Bearish Engulfing")
+                # 2. Exhaustion
+                d, r = s2_body_exhaustion(op, cl)
+                if d == "CALL": call_v += 1; reasons.append(r)
+                elif d == "PUT": put_v += 1; reasons.append(r)
 
-                # 5. Pin Bar
-                pin_dir = calc_pinbar(opens, closes, highs, lows)
-                if pin_dir == "CALL":
-                    call_votes += 1
-                    active_strategies.append("Hammer Pin Bar")
-                elif pin_dir == "PUT":
-                    put_votes += 1
-                    active_strategies.append("Shooting Star")
+                # 3. Wick Rejection
+                d, r = s3_wick_rejection(op, cl, hi, lo)
+                if d == "CALL": call_v += 1; reasons.append(r)
+                elif d == "PUT": put_v += 1; reasons.append(r)
 
-                # === CONFLUENCE CHECK ===
+                # 4. RSI Extreme
+                d, r = s4_rsi_extreme(cl)
+                if d == "CALL": call_v += 1; reasons.append(r)
+                elif d == "PUT": put_v += 1; reasons.append(r)
+
+                # 5. Engulfing
+                d, r = s5_engulfing_reversal(op, cl)
+                if d == "CALL": call_v += 1; reasons.append(r)
+                elif d == "PUT": put_v += 1; reasons.append(r)
+
+                # ===== CONFLUENCE CHECK =====
                 direction = None
-                confluence_count = 0
+                score = 0
 
-                if call_votes >= MIN_CONFLUENCE and call_votes > put_votes:
+                if call_v >= MIN_CONFLUENCE and call_v > put_v:
                     direction = "CALL"
-                    confluence_count = call_votes
-                elif put_votes >= MIN_CONFLUENCE and put_votes > call_votes:
+                    score = call_v
+                elif put_v >= MIN_CONFLUENCE and put_v > call_v:
                     direction = "PUT"
-                    confluence_count = put_votes
+                    score = put_v
 
-                # শুধুমাত্র Strong Confluence হলেই সিগন্যাল
-                if direction and (time.time() - last_signal_time.get(ticker, 0) > 180):
-                    emoji = "🟢 CALL (BUY)" if direction == "CALL" else "🔴 PUT (SELL)"
+                if direction and (time.time() - last_signal_time.get(ticker, 0) > COOLDOWN):
                     pair = ticker.replace("=X", "")
-                    strength = "🔥🔥🔥" if confluence_count >= 4 else "🔥🔥"
+                    arrow = "🟢 CALL (BUY)" if direction == "CALL" else "🔴 PUT (SELL)"
+                    fire = "🔥" * score
 
-                    strategies_text = "\n".join([f"  ✅ {s}" for s in active_strategies])
+                    if direction == "CALL":
+                        candle_rule = "এই ক্যান্ডেল 🔴 RED → পরের ক্যান্ডেল 🟢 GREEN"
+                    else:
+                        candle_rule = "এই ক্যান্ডেল 🟢 GREEN → পরের ক্যান্ডেল 🔴 RED"
 
-                    text = f"""🚨 *PRO CONFLUENCE SIGNAL* 🚨
-━━━━━━━━━━━━━━━━━━
-📊 *Asset:* `{pair}`
-🎯 *Direction:* **{emoji}**
-💪 *Strength:* {strength} ({confluence_count}/5 Match)
-⏳ *Entry:* `{next_time_str}` (00s)
+                    reason_text = "\n".join([f"  ✅ {r}" for r in reasons])
+
+                    text = f"""🚨 *CANDLE COLOR PREDICTION* 🚨
+━━━━━━━━━━━━━━━━━━━━━━
+📊 *Pair:* `{pair}`
+🎯 *Next Candle:* **{arrow}**
+💡 *Rule:* {candle_rule}
+💪 *Strength:* {fire} ({score}/5 Confirm)
+⏳ *Entry:* `{entry_time}` (Exact 00s)
 ⏰ *Expiry:* 1 MINUTE
-━━━━━━━━━━━━━━━━━━
-📋 *Active Confirmations:*
-{strategies_text}
-━━━━━━━━━━━━━━━━━━
-⚠️ Enter at 00-second!
+━━━━━━━━━━━━━━━━━━━━━━
+📋 *Confirmations:*
+{reason_text}
+━━━━━━━━━━━━━━━━━━━━━━
+⚠️ Enter at 00-second sharp!
 💡 1-Step MTG if needed
-👑 *TB V22 Pro Tracker*"""
+👑 *TB V23 Pro Predictor*"""
 
-                    msg_id = send_telegram(text)
+                    msg_id = send_tg(text)
                     if msg_id:
                         pending_results.append({
                             "ticker": ticker,
                             "direction": direction,
                             "msg_id": msg_id,
-                            "expiry_timestamp": expiry_ts,
-                            "confluence": confluence_count,
+                            "expiry_ts": expiry,
+                            "score": score,
                             "retries": 0
                         })
                         last_signal_time[ticker] = time.time()
-                        print(f"✅ SIGNAL: {pair} -> {direction} ({confluence_count}/5)")
+                        print(f"✅ SIGNAL: {pair} -> {direction} ({score}/5)")
+
+                # Yahoo Rate limit বাঁচানোর জন্য সামান্য বিরতি
+                time.sleep(0.3)
 
             except Exception as e:
                 continue
 
     except Exception as e:
-        print("Analyze error:", e)
+        print("Analyze loop error:", e)
 
 # =============================================
-# --- RESULT CHECKER (WIN/LOSS REPLY) ---
+# --- WIN/LOSS AUTO REPLY ENGINE ---
 # =============================================
-def check_pending_results():
+def check_results():
     global pending_results, scoreboard
     now = time.time()
-    still_pending = []
+    keep = []
 
     for item in pending_results:
-        if now < item["expiry_timestamp"] + 12:
-            still_pending.append(item)
+        if now < item["expiry_ts"] + 15:
+            keep.append(item)
             continue
 
         try:
-            df = yf.download(item["ticker"], period="1d", interval="1m", progress=False)
-            if df.empty or len(df) < 2:
+            df = fetch_safe_data(item["ticker"])
+            if df is None or len(df) < 2:
                 item["retries"] = item.get("retries", 0) + 1
                 if item["retries"] <= 3:
-                    still_pending.append(item)
+                    keep.append(item)
                 continue
-
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
 
             c_open = float(df["Open"].iloc[-2])
             c_close = float(df["Close"].iloc[-2])
             diff = c_close - c_open
 
-            if abs(diff) < 0.00001:
-                result_status = "DOJI"
+            if abs(diff) < 0.000005:
+                actual = "DOJI"
             elif diff > 0:
-                result_status = "CALL"
+                actual = "CALL"
             else:
-                result_status = "PUT"
+                actual = "PUT"
 
             pair = item["ticker"].replace("=X", "")
-            conf = item.get("confluence", 3)
-            stars = "⭐" * conf
+            stars = "⭐" * item.get("score", 4)
 
-            if result_status == "DOJI":
+            if actual == "DOJI":
                 scoreboard["doji"] += 1
-                reply = f"""⚖️ *RESULT: DOJI / TIE*
-━━━━━━━━━━━━━━━━━━
-📊 `{pair}` | Prediction: `{item['direction']}`
-📈 Open: `{c_open:.5f}` → Close: `{c_close:.5f}`
-💡 Refund Trade
-━━━━━━━━━━━━━━━━━━
-👑 *TB V22 Pro Tracker*"""
-
-            elif result_status == item["direction"]:
-                scoreboard["wins"] += 1
-                total = scoreboard["wins"] + scoreboard["losses"]
-                wr = (scoreboard["wins"] / total) * 100 if total > 0 else 100
-                reply = f"""✅ *RESULT: WIN!* 🎉
+                reply = f"""⚖️ *RESULT: DOJI (TIE)*
 ━━━━━━━━━━━━━━━━━━
 📊 `{pair}` | {stars}
-🎯 Prediction: `{'🟢 CALL' if item['direction'] == 'CALL' else '🔴 PUT'}`
+🎯 Predicted: `{item['direction']}`
+📈 Open: `{c_open:.5f}` → Close: `{c_close:.5f}`
+💡 Trade Refund
+━━━━━━━━━━━━━━━━━━
+👑 *TB V23 Pro*"""
+
+            elif actual == item["direction"]:
+                scoreboard["wins"] += 1
+                t = scoreboard["wins"] + scoreboard["losses"]
+                wr = (scoreboard["wins"] / t) * 100 if t > 0 else 100
+                reply = f"""✅ *RESULT: WIN!* 🎉💰
+━━━━━━━━━━━━━━━━━━
+📊 `{pair}` | {stars}
+🎯 Predicted: `{'🟢 GREEN' if item['direction'] == 'CALL' else '🔴 RED'}`
+✅ Actual: `{'🟢 GREEN' if actual == 'CALL' else '🔴 RED'}`
 📈 Open: `{c_open:.5f}`
 📉 Close: `{c_close:.5f}`
 💰 *PROFIT CONFIRMED!*
 ━━━━━━━━━━━━━━━━━━
-📊 Score: *{scoreboard['wins']}W - {scoreboard['losses']}L* ({wr:.1f}%)
-👑 *TB V22 Pro Tracker*"""
+📊 Score: *{scoreboard['wins']}W / {scoreboard['losses']}L* ({wr:.1f}% WR)
+👑 *TB V23 Pro*"""
 
             else:
                 scoreboard["losses"] += 1
-                total = scoreboard["wins"] + scoreboard["losses"]
-                wr = (scoreboard["wins"] / total) * 100 if total > 0 else 0
+                t = scoreboard["wins"] + scoreboard["losses"]
+                wr = (scoreboard["wins"] / t) * 100 if t > 0 else 0
                 reply = f"""❌ *RESULT: LOSS*
 ━━━━━━━━━━━━━━━━━━
 📊 `{pair}` | {stars}
-🎯 Prediction: `{'🟢 CALL' if item['direction'] == 'CALL' else '🔴 PUT'}`
+🎯 Predicted: `{'🟢 GREEN' if item['direction'] == 'CALL' else '🔴 RED'}`
+❌ Actual: `{'🟢 GREEN' if actual == 'CALL' else '🔴 RED'}`
 📈 Open: `{c_open:.5f}`
 📉 Close: `{c_close:.5f}`
-💡 Use 1-Step MTG
+💡 Use 1-Step MTG to recover
 ━━━━━━━━━━━━━━━━━━
-📊 Score: *{scoreboard['wins']}W - {scoreboard['losses']}L* ({wr:.1f}%)
-👑 *TB V22 Pro Tracker*"""
+📊 Score: *{scoreboard['wins']}W / {scoreboard['losses']}L* ({wr:.1f}% WR)
+👑 *TB V23 Pro*"""
 
-            send_telegram(reply, reply_to=item["msg_id"])
-            print(f"📩 Result: {pair} -> {result_status} ({'WIN' if result_status == item['direction'] else 'LOSS'})")
+            send_tg(reply, reply_to=item["msg_id"])
+            print(f"📩 Result: {pair} -> {'WIN ✅' if actual == item['direction'] else 'LOSS ❌'}")
 
         except Exception as e:
             print(f"Result error {item['ticker']}: {e}")
             item["retries"] = item.get("retries", 0) + 1
             if item["retries"] <= 3:
-                still_pending.append(item)
+                keep.append(item)
 
-    pending_results = still_pending
+    pending_results = keep
 
 # =============================================
 # --- MAIN LOOP ---
 # =============================================
 def main():
-    threading.Thread(target=run_web_server, daemon=True).start()
+    threading.Thread(target=run_server, daemon=True).start()
 
-    send_telegram(
-        "🚀 *TB V22 Pro Confluence Tracker Online!*\n\n"
-        "📋 *5 Strategies Active:*\n"
-        "1️⃣ RSI Reversal\n"
-        "2️⃣ EMA 9/21 Crossover\n"
-        "3️⃣ Bollinger Band Bounce\n"
-        "4️⃣ Engulfing Pattern\n"
-        "5️⃣ Pin Bar / Hammer\n\n"
-        f"🎯 *Min Confluence:* {MIN_CONFLUENCE}/5\n"
-        "💡 Only signals when 3+ strategies agree!\n"
-        "⏳ Auto WIN/LOSS reply enabled."
+    send_tg(
+        "🚀 *TB V23 Pro Candle Predictor Online (Fixed)!*\n\n"
+        "✅ Yahoo Finance Block & Database Lock fixed.\n"
+        "🎯 *Min Confluence:* 4/5 Confirmations\n"
+        "⏳ Auto WIN/LOSS Reply enabled."
     )
-    print("TB V22 Pro running...")
+    print("TB V23 Pro Running Smoothly...")
 
     while True:
-        analyze_and_signal()
-        check_pending_results()
+        analyze()
+        check_results()
         time.sleep(8)
 
 if __name__ == "__main__":
