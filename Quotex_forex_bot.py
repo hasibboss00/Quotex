@@ -8,23 +8,20 @@ import numpy as np
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# --- FIX DATABASE LOCKED ERROR ---
-# Render/Cloud এ SQLite ডাটাবেজ লক হওয়া বন্ধ করতে ক্যাশ লোকেশন পরিবর্তন
+# --- DATABASE LOCK FIX ---
 try:
     yf.set_tz_cache_location("/tmp/yf_tz")
-except Exception:
+except:
     pass
 
 # =============================================
-# --- RENDER KEEP-ALIVE WEB SERVER ---
+# --- RENDER KEEP-ALIVE ---
 # =============================================
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"TB V23 Pro Candle Predictor Online & Fixed!")
-    def log_message(self, *a):
-        pass
+        self.send_response(200); self.end_headers()
+        self.wfile.write(b"TB V24 Price Action Sniper Online!")
+    def log_message(self, *a): pass
 
 def run_server():
     port = int(os.environ.get("PORT", 10000))
@@ -41,351 +38,177 @@ TICKERS = [
     "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "EURGBP=X", "USDCHF=X"
 ]
 
-# 🔑 KEY SETTINGS — 5 মিনিটে ১-২টি High Quality Trade এর জন্য
-MIN_CONFLUENCE = 4    # ৫টির মধ্যে কমপক্ষে ৪টি মিলতে হবে
-COOLDOWN = 240        # ৪ মিনিট কুলডাউন
-
 last_signal_time = {}
 pending_results = []
 scoreboard = {"wins": 0, "losses": 0, "doji": 0}
 
-# =============================================
-# --- TELEGRAM ---
-# =============================================
 def send_tg(text, reply_to=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": GROUP_ID, "text": text, "parse_mode": "Markdown"}
-    if reply_to:
-        payload["reply_to_message_id"] = reply_to
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code == 200:
-            return r.json()["result"]["message_id"]
-    except Exception as e:
-        print("TG Send Error:", e)
-    return None
+    if reply_to: payload["reply_to_message_id"] = reply_to
+    try: r = requests.post(url, json=payload, timeout=10)
+    except: pass
 
 # =============================================
-# --- SAFE DATA FETCHING (FIX 401 & LOCK) ---
-# =============================================
-def fetch_safe_data(ticker):
-    """Yahoo Block এড়াতে ১টি করে পেয়ার ফেচ করা"""
-    try:
-        df = yf.download(ticker, period="1d", interval="1m", progress=False)
-        if df.empty or len(df) < 20:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
-    except Exception as e:
-        print(f"Fetch Error [{ticker}]: {e}")
-        return None
-
-# =============================================
-# --- 5 PRO CANDLE STRATEGIES ---
+# --- PURE PRICE ACTION LOGIC (The Pro Way) ---
 # =============================================
 
-def s1_consecutive_reversal(opens, closes):
-    if len(closes) < 4:
-        return "", ""
-    colors = ["G" if closes[i] > opens[i] else "R" if closes[i] < opens[i] else "D" for i in range(-4, 0)]
+def analyze_price_action(df):
+    """
+    একজন ৩০ বছরের ট্রেডারের অভিজ্ঞতায় ১ মিনিটের সেরা ৩টি লজিক
+    """
+    cl = df["Close"].tolist()
+    op = df["Open"].tolist()
+    hi = df["High"].tolist()
+    lo = df["Low"].tolist()
 
-    if colors[-1] == colors[-2] == colors[-3] == "G":
-        return "PUT", "3x Green Streak → Next Red 🔴"
-    elif colors[-1] == colors[-2] == colors[-3] == "R":
-        return "CALL", "3x Red Streak → Next Green 🟢"
-    return "", ""
+    # ১. সাপোর্ট এবং রেজিস্ট্যান্স লেভেল বের করা (গত ৩০ ক্যান্ডেলের)
+    res_level = max(hi[-30:-1])
+    sup_level = min(lo[-30:-1])
+    
+    curr_hi = hi[-1]
+    curr_lo = lo[-1]
+    curr_cl = cl[-1]
+    curr_op = op[-1]
+    
+    # ২. রাউন্ড নাম্বার চেক (যেমন .500, .000)
+    def is_round_number(price):
+        p_str = f"{price:.5f}"
+        return p_str.endswith("00") or p_str.endswith("50")
 
-def s2_body_exhaustion(opens, closes):
-    if len(closes) < 12:
-        return "", ""
-    bodies = [abs(closes[i] - opens[i]) for i in range(-12, 0)]
-    avg_body = np.mean(bodies[:-1])
-    last_body = bodies[-1]
-    if avg_body == 0:
-        return "", ""
+    # ৩. ক্যান্ডেল বডি এবং উইক এনালাইসিস
+    body = abs(curr_cl - curr_op)
+    u_wick = curr_hi - max(curr_cl, curr_op)
+    l_wick = min(curr_cl, curr_op) - curr_lo
+    
+    direction, logic = None, ""
 
-    if last_body > avg_body * 2.3:
-        if closes[-1] > opens[-1]:
-            return "PUT", "Big Green Exhaustion → Next Red 🔴"
-        else:
-            return "CALL", "Big Red Exhaustion → Next Green 🟢"
-    return "", ""
+    # --- STRATEGY 1: SNR REJECTION (সবথেকে শক্তিশালী) ---
+    if curr_hi >= res_level and u_wick > body:
+        direction, logic = "PUT", "Strong Resistance Rejection 🏰"
+    elif curr_lo <= sup_level and l_wick > body:
+        direction, logic = "CALL", "Strong Support Rejection 🛡️"
 
-def s3_wick_rejection(opens, closes, highs, lows):
-    if len(opens) < 2:
-        return "", ""
+    # --- STRATEGY 2: ROUND NUMBER REJECTION ---
+    elif is_round_number(curr_hi) and u_wick > (body * 0.5):
+        direction, logic = "PUT", "Psychological Round Number Reject 🎯"
+    elif is_round_number(curr_lo) and l_wick > (body * 0.5):
+        direction, logic = "CALL", "Psychological Round Number Reject 🎯"
 
-    def wick_ratio(o, c, h, l):
-        rng = h - l
-        if rng == 0:
-            return 0, 0
-        return (h - max(o, c)) / rng, (min(o, c) - l) / rng
+    # --- STRATEGY 3: CANDLE EXHAUSTION (V-Shape Reversal) ---
+    else:
+        avg_body = np.mean([abs(cl[i]-op[i]) for i in range(-10, -1)])
+        if body > (avg_body * 2.5): # হঠাৎ অস্বাভাবিক বড় ক্যান্ডেল
+            if curr_cl > curr_op:
+                direction, logic = "PUT", "Bullish Exhaustion (Over-Extended) 🎈"
+            else:
+                direction, logic = "CALL", "Bearish Exhaustion (Over-Extended) 🎈"
 
-    u1, l1 = wick_ratio(opens[-2], closes[-2], highs[-2], lows[-2])
-    u2, l2 = wick_ratio(opens[-1], closes[-1], highs[-1], lows[-1])
-
-    if l1 > 0.40 and l2 > 0.40:
-        return "CALL", "Double Lower Wick Rejection → Next Green 🟢"
-    elif u1 > 0.40 and u2 > 0.40:
-        return "PUT", "Double Upper Wick Rejection → Next Red 🔴"
-    return "", ""
-
-def s4_rsi_extreme(closes, period=14):
-    if len(closes) < period + 2:
-        return "", ""
-    deltas = np.diff(closes)
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    ag = np.mean(gains[-period:])
-    al = np.mean(losses[-period:])
-    rsi = 100 if al == 0 else 100 - (100 / (1 + ag / al))
-
-    if rsi < 28:
-        return "CALL", f"RSI({rsi:.0f}) Oversold → Next Green 🟢"
-    elif rsi > 72:
-        return "PUT", f"RSI({rsi:.0f}) Overbought → Next Red 🔴"
-    return "", ""
-
-def s5_engulfing_reversal(opens, closes):
-    if len(opens) < 3:
-        return "", ""
-
-    p_o, p_c = opens[-2], closes[-2]
-    c_o, c_c = opens[-1], closes[-1]
-    p_body = abs(p_c - p_o)
-    c_body = abs(c_c - c_o)
-
-    if p_c < p_o and c_c > c_o and c_o <= p_c and c_c >= p_o and c_body > p_body * 1.1:
-        return "CALL", "Bullish Engulfing → Next Green 🟢"
-    elif p_c > p_o and c_c < c_o and c_o >= p_c and c_c <= p_o and c_body > p_body * 1.1:
-        return "PUT", "Bearish Engulfing → Next Red 🔴"
-    return "", ""
+    return direction, logic
 
 # =============================================
-# --- MAIN ANALYSIS ENGINE ---
+# --- CORE ENGINE ---
 # =============================================
-def analyze():
+def main_process():
     try:
         now = datetime.now()
-        nxt_m = (now.minute + 1) % 60
-        nxt_h = now.hour if nxt_m != 0 else (now.hour + 1) % 24
-        entry_time = f"{nxt_h:02d}:{nxt_m:02d}:00"
-
-        trade_start = time.time() + (60 - now.second)
-        expiry = trade_start + 60
-
+        entry_time = f"{(now.hour if (now.minute+1)<60 else (now.hour+1)%24):02d}:{(now.minute+1)%60:02d}:00"
+        
         for ticker in TICKERS:
-            try:
-                # 안전ভাবে প্রতি পেয়ারের ডাটা আনা
-                df = fetch_safe_data(ticker)
-                if df is None:
-                    continue
+            # Yahoo Block এড়াতে সিকোয়েন্সিয়াল ডাউনলোড
+            df = yf.download(ticker, period="1d", interval="1m", progress=False)
+            if df is None or len(df) < 35: continue
+            
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
 
-                cl = df["Close"].dropna().tolist()
-                op = df["Open"].dropna().tolist()
-                hi = df["High"].dropna().tolist()
-                lo = df["Low"].dropna().tolist()
+            direction, logic = analyze_price_action(df)
+            
+            # সিগন্যাল পাঠানোর শর্ত (৩ মিনিট কুলডাউন)
+            if direction and (time.time() - last_signal_time.get(ticker, 0) > 180):
+                pair = ticker.replace("=X", "")
+                
+                # Rule description
+                if direction == "CALL":
+                    rule = "Next Candle: 🟢 GREEN (BUY)"
+                else:
+                    rule = "Next Candle: 🔴 RED (SELL)"
 
-                if len(cl) < 20:
-                    continue
-
-                call_v, put_v = 0, 0
-                reasons = []
-
-                # 1. Consecutive
-                d, r = s1_consecutive_reversal(op, cl)
-                if d == "CALL": call_v += 1; reasons.append(r)
-                elif d == "PUT": put_v += 1; reasons.append(r)
-
-                # 2. Exhaustion
-                d, r = s2_body_exhaustion(op, cl)
-                if d == "CALL": call_v += 1; reasons.append(r)
-                elif d == "PUT": put_v += 1; reasons.append(r)
-
-                # 3. Wick Rejection
-                d, r = s3_wick_rejection(op, cl, hi, lo)
-                if d == "CALL": call_v += 1; reasons.append(r)
-                elif d == "PUT": put_v += 1; reasons.append(r)
-
-                # 4. RSI Extreme
-                d, r = s4_rsi_extreme(cl)
-                if d == "CALL": call_v += 1; reasons.append(r)
-                elif d == "PUT": put_v += 1; reasons.append(r)
-
-                # 5. Engulfing
-                d, r = s5_engulfing_reversal(op, cl)
-                if d == "CALL": call_v += 1; reasons.append(r)
-                elif d == "PUT": put_v += 1; reasons.append(r)
-
-                # ===== CONFLUENCE CHECK =====
-                direction = None
-                score = 0
-
-                if call_v >= MIN_CONFLUENCE and call_v > put_v:
-                    direction = "CALL"
-                    score = call_v
-                elif put_v >= MIN_CONFLUENCE and put_v > call_v:
-                    direction = "PUT"
-                    score = put_v
-
-                if direction and (time.time() - last_signal_time.get(ticker, 0) > COOLDOWN):
-                    pair = ticker.replace("=X", "")
-                    arrow = "🟢 CALL (BUY)" if direction == "CALL" else "🔴 PUT (SELL)"
-                    fire = "🔥" * score
-
-                    if direction == "CALL":
-                        candle_rule = "এই ক্যান্ডেল 🔴 RED → পরের ক্যান্ডেল 🟢 GREEN"
-                    else:
-                        candle_rule = "এই ক্যান্ডেল 🟢 GREEN → পরের ক্যান্ডেল 🔴 RED"
-
-                    reason_text = "\n".join([f"  ✅ {r}" for r in reasons])
-
-                    text = f"""🚨 *CANDLE COLOR PREDICTION* 🚨
+                text = f"""🔥 *SNR PRICE ACTION SNIPER* 🔥
 ━━━━━━━━━━━━━━━━━━━━━━
-📊 *Pair:* `{pair}`
-🎯 *Next Candle:* **{arrow}**
-💡 *Rule:* {candle_rule}
-💪 *Strength:* {fire} ({score}/5 Confirm)
+📊 *Asset:* `{pair}`
+🎯 *Action:* **{direction}**
+💡 *Logic:* `{logic}`
 ⏳ *Entry:* `{entry_time}` (Exact 00s)
-⏰ *Expiry:* 1 MINUTE
+⏰ *Duration:* 1 MINUTE
 ━━━━━━━━━━━━━━━━━━━━━━
-📋 *Confirmations:*
-{reason_text}
-━━━━━━━━━━━━━━━━━━━━━━
-⚠️ Enter at 00-second sharp!
-💡 1-Step MTG if needed
-👑 *TB V23 Pro Predictor*"""
+✅ {rule}
+⚠️ Wait for the candle to close!
+👑 *TB V24 EXPERT BOT*"""
 
-                    msg_id = send_tg(text)
-                    if msg_id:
-                        pending_results.append({
-                            "ticker": ticker,
-                            "direction": direction,
-                            "msg_id": msg_id,
-                            "expiry_ts": expiry,
-                            "score": score,
-                            "retries": 0
-                        })
-                        last_signal_time[ticker] = time.time()
-                        print(f"✅ SIGNAL: {pair} -> {direction} ({score}/5)")
-
-                # Yahoo Rate limit বাঁচানোর জন্য সামান্য বিরতি
-                time.sleep(0.3)
-
-            except Exception as e:
-                continue
+                msg_id = send_tg(text)
+                last_signal_time[ticker] = time.time()
+                
+                pending_results.append({
+                    "ticker": ticker,
+                    "direction": direction,
+                    "msg_id": msg_id,
+                    "expiry": time.time() + (60 - now.second) + 60,
+                    "retries": 0
+                })
+                print(f"🎯 Signal: {pair} {direction}")
+            
+            time.sleep(0.5) # Anti-block delay
 
     except Exception as e:
-        print("Analyze loop error:", e)
+        print(f"Error: {e}")
 
-# =============================================
-# --- WIN/LOSS AUTO REPLY ENGINE ---
-# =============================================
 def check_results():
     global pending_results, scoreboard
     now = time.time()
-    keep = []
+    still_pending = []
 
     for item in pending_results:
-        if now < item["expiry_ts"] + 15:
-            keep.append(item)
+        if now < item["expiry"] + 12:
+            still_pending.append(item)
             continue
-
+        
         try:
-            df = fetch_safe_data(item["ticker"])
-            if df is None or len(df) < 2:
-                item["retries"] = item.get("retries", 0) + 1
-                if item["retries"] <= 3:
-                    keep.append(item)
-                continue
-
+            df = yf.download(item["ticker"], period="1d", interval="1m", progress=False)
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            
             c_open = float(df["Open"].iloc[-2])
             c_close = float(df["Close"].iloc[-2])
-            diff = c_close - c_open
-
-            if abs(diff) < 0.000005:
-                actual = "DOJI"
-            elif diff > 0:
-                actual = "CALL"
-            else:
-                actual = "PUT"
-
+            
+            res = "CALL" if c_close > c_open else "PUT" if c_close < c_open else "DOJI"
             pair = item["ticker"].replace("=X", "")
-            stars = "⭐" * item.get("score", 4)
-
-            if actual == "DOJI":
+            
+            if res == "DOJI":
                 scoreboard["doji"] += 1
-                reply = f"""⚖️ *RESULT: DOJI (TIE)*
-━━━━━━━━━━━━━━━━━━
-📊 `{pair}` | {stars}
-🎯 Predicted: `{item['direction']}`
-📈 Open: `{c_open:.5f}` → Close: `{c_close:.5f}`
-💡 Trade Refund
-━━━━━━━━━━━━━━━━━━
-👑 *TB V23 Pro*"""
-
-            elif actual == item["direction"]:
+                msg = f"⚖️ *RESULT: DOJI (REFUND)*\nAsset: {pair}\nLevel held the price."
+            elif res == item["direction"]:
                 scoreboard["wins"] += 1
-                t = scoreboard["wins"] + scoreboard["losses"]
-                wr = (scoreboard["wins"] / t) * 100 if t > 0 else 100
-                reply = f"""✅ *RESULT: WIN!* 🎉💰
-━━━━━━━━━━━━━━━━━━
-📊 `{pair}` | {stars}
-🎯 Predicted: `{'🟢 GREEN' if item['direction'] == 'CALL' else '🔴 RED'}`
-✅ Actual: `{'🟢 GREEN' if actual == 'CALL' else '🔴 RED'}`
-📈 Open: `{c_open:.5f}`
-📉 Close: `{c_close:.5f}`
-💰 *PROFIT CONFIRMED!*
-━━━━━━━━━━━━━━━━━━
-📊 Score: *{scoreboard['wins']}W / {scoreboard['losses']}L* ({wr:.1f}% WR)
-👑 *TB V23 Pro*"""
-
+                wr = (scoreboard["wins"] / (scoreboard["wins"] + scoreboard["losses"])) * 100
+                msg = f"✅ *WINNING SNIPE!* 💰\nAsset: {pair}\nOutcome: {res}\nWin Rate: {wr:.1f}%"
             else:
                 scoreboard["losses"] += 1
-                t = scoreboard["wins"] + scoreboard["losses"]
-                wr = (scoreboard["wins"] / t) * 100 if t > 0 else 0
-                reply = f"""❌ *RESULT: LOSS*
-━━━━━━━━━━━━━━━━━━
-📊 `{pair}` | {stars}
-🎯 Predicted: `{'🟢 GREEN' if item['direction'] == 'CALL' else '🔴 RED'}`
-❌ Actual: `{'🟢 GREEN' if actual == 'CALL' else '🔴 RED'}`
-📈 Open: `{c_open:.5f}`
-📉 Close: `{c_close:.5f}`
-💡 Use 1-Step MTG to recover
-━━━━━━━━━━━━━━━━━━
-📊 Score: *{scoreboard['wins']}W / {scoreboard['losses']}L* ({wr:.1f}% WR)
-👑 *TB V23 Pro*"""
+                wr = (scoreboard["wins"] / (scoreboard["wins"] + scoreboard["losses"])) * 100
+                msg = f"❌ *LOSS (MTG 1 Needed)*\nAsset: {pair}\nOutcome: {res}\nWin Rate: {wr:.1f}%"
+            
+            send_tg(msg, reply_to=item["msg_id"])
+        except:
+            pass
 
-            send_tg(reply, reply_to=item["msg_id"])
-            print(f"📩 Result: {pair} -> {'WIN ✅' if actual == item['direction'] else 'LOSS ❌'}")
+    pending_results = still_pending
 
-        except Exception as e:
-            print(f"Result error {item['ticker']}: {e}")
-            item["retries"] = item.get("retries", 0) + 1
-            if item["retries"] <= 3:
-                keep.append(item)
-
-    pending_results = keep
-
-# =============================================
-# --- MAIN LOOP ---
-# =============================================
 def main():
     threading.Thread(target=run_server, daemon=True).start()
-
-    send_tg(
-        "🚀 *TB V23 Pro Candle Predictor Online (Fixed)!*\n\n"
-        "✅ Yahoo Finance Block & Database Lock fixed.\n"
-        "🎯 *Min Confluence:* 4/5 Confirmations\n"
-        "⏳ Auto WIN/LOSS Reply enabled."
-    )
-    print("TB V23 Pro Running Smoothly...")
-
+    send_tg("🚀 *TB V24 Price Action Sniper Online!*\nNo Indicators, Only Levels & Rejection.")
+    
     while True:
-        analyze()
+        main_process()
         check_results()
-        time.sleep(8)
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
