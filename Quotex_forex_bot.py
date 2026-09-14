@@ -6,12 +6,12 @@ import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# --- RENDER KEEP-ALIVE WEB SERVER ---
+# --- RENDER KEEP-ALIVE SERVER ---
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"TB Master Binary Predictor V17 is Running!")
+        self.wfile.write(b"TB V17.1 Predictive Engine is Alive!")
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
@@ -22,110 +22,93 @@ def run_web_server():
 TOKEN = "8958179212:AAGRaqegMW4WJS9KTz1MwaU5lh5wtui4HQ0"
 GROUP_ID = "-5160285764"
 
-# ১০টি হাই-লিকুইডিটি ফরেক্স পেয়ার
-TICKERS = [
-    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X",
-    "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "EURGBP=X", "USDCHF=X"
-]
+# ডাটা ফেচিং সহজ করার জন্য ৫টি প্রধান পেয়ার (সিগন্যাল স্পিড বাড়বে)
+TICKERS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "BTC-USD"]
 
 last_signal_time = {}
 
-def send_telegram_signal(pair, direction, logic_name, next_candle_time):
-    emoji = "🟢 CALL (BUY)" if direction == "CALL" else "🔴 PUT (SELL)"
-    pair_name = pair.replace('=X', '')
-    
-    msg = f"""
-🚨 *NEXT-CANDLE PREDICTIVE SIGNAL* 🚨
------------------------------------------
-📊 *Asset:* `{pair_name}`
-🎯 *Predictive Action:* **{emoji}**
-⏳ *Trade Start:* `{next_candle_time}` (Exact 00s)
-⏰ *Expiry:* 1 MINUTE
-💡 *Pattern:* `{logic_name}`
------------------------------------------
-⚠️ *Rule:* Enter exactly at 00-second of next candle!
-💡 Use 1-Step Martingale if needed!
-👑 *Target Billionaire V17 Master Engine*
-"""
+def send_msg(text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": GROUP_ID, "text": text, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json={"chat_id": GROUP_ID, "text": msg, "parse_mode": "Markdown"}, timeout=5)
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] PREDICTION SENT: {pair_name} -> {direction}")
-    except Exception as e:
-        print(f"Telegram Send Error: {e}")
+        r = requests.post(url, json=payload, timeout=10)
+        return r.status_code == 200
+    except:
+        return False
 
 def main():
+    # ১. ওয়েব সার্ভার স্টার্ট
     threading.Thread(target=run_web_server, daemon=True).start()
-    print("🚀 Master Binary Predictor V17 Active...")
     
-    # বোট অনলাইন কনফার্মেশন
-    try:
-        requests.get(f"https://api.telegram.org/bot{TOKEN}/sendMessage?chat_id={GROUP_ID}&text=🔮 *Target Billionaire V17 Engine Online!* \nCandle Pattern & Next-Candle Predictor Active.")
-    except: pass
+    # ২. ইমিডিয়েট স্টার্টআপ মেসেজ (এটি না আসলে বুঝবে টোকেন/আইডি ভুল)
+    print("Sending startup message...")
+    startup_ok = send_msg("🚀 *TB V17.1 Master Predictor Online!* \nChecking market data now...")
+    if not startup_ok:
+        print("❌ Error: Could not send Telegram message. Check Token/ID.")
 
     while True:
         try:
-            # একবারে সব পেয়ারের ডাটা ফেচ
-            data = yf.download(TICKERS, period="1d", interval="1m", progress=False).tail(5)
             now = datetime.now()
-
-            # পরবর্তী মিনিটের সময় নির্ধারণ (যেমন: ১২:৩৫:০০)
+            # ডাটা ডাউনলোড (৫টি পেয়ার একবারে)
+            data = yf.download(TICKERS, period="1d", interval="1m", progress=False).tail(5)
+            
+            # টাইম প্রেডিকশন
             next_min = (now.minute + 1) % 60
             next_hour = now.hour if next_min != 0 else (now.hour + 1) % 24
-            next_candle_time = f"{next_hour:02d}:{next_min:02d}:00 UTC"
+            next_time = f"{next_hour:02d}:{next_min:02d}:00 UTC"
 
             for ticker in TICKERS:
                 try:
-                    closes = data['Close'][ticker].tolist()
-                    opens = data['Open'][ticker].tolist()
-                    highs = data['High'][ticker].tolist()
-                    lows = data['Low'][ticker].tolist()
+                    # ওটিসি/ফরেক্স ডাটা হ্যান্ডলিং
+                    prices = data['Close'][ticker]
+                    opens = data['Open'][ticker]
+                    highs = data['High'][ticker]
+                    lows = data['Low'][ticker]
 
-                    c0_close, c0_open = closes[-1], opens[-1] # বর্তমান ক্যান্ডেল
-                    c1_close, c1_open = closes[-2], opens[-2] # আগের ক্যান্ডেল
-                    c2_close, c2_open = closes[-3], opens[-3] # ২ ক্যান্ডেল আগের
+                    c0_close, c0_open = prices.iloc[-1], opens.iloc[-1]
+                    c1_close, c1_open = prices.iloc[-2], opens.iloc[-2]
+                    c0_high, c0_low = highs.iloc[-1], lows.iloc[-1]
 
-                    c0_high, c0_low = highs[-1], lows[-1]
-                    rng0 = max(c0_high - c0_low, 0.00001)
-                    l_wick0 = min(c0_open, c0_close) - c0_low
-                    u_wick0 = c0_high - max(c0_open, c0_close)
+                    rng = max(c0_high - c0_low, 0.00001)
+                    l_wick = min(c0_open, c0_close) - c0_low
+                    u_wick = c0_high - max(c0_open, c0_close)
 
-                    direction = None
-                    logic_name = ""
+                    direction, pattern = None, ""
 
-                    # --- 1. PINBAR PRESSURE (WICK REJECTION) ---
-                    if (l_wick0 / rng0) > 0.38 and c0_close > c0_open:
-                        direction, logic_name = "CALL", "Buyer Wick Pressure 🚀"
-                    elif (u_wick0 / rng0) > 0.38 and c0_close < c0_open:
-                        direction, logic_name = "PUT", "Seller Wick Pressure 📉"
+                    # --- লজিক ফিল্টার ---
+                    # ১. রিজেকশন (৩৫% উইক)
+                    if (l_wick / rng) > 0.35 and c0_close > c0_open:
+                        direction, pattern = "CALL", "Buyer Rejection 🚀"
+                    elif (u_wick / rng) > 0.35 and c0_close < c0_open:
+                        direction, pattern = "PUT", "Seller Rejection 📉"
+                    # ২. কালার ফ্লিপ (Engulfing-ish)
+                    elif c1_close < c1_open and c0_close > c0_open and c0_close > c1_open:
+                        direction, pattern = "CALL", "Bullish Flip 🟢"
+                    elif c1_close > c1_open and c0_close < c0_open and c0_close < c1_open:
+                        direction, pattern = "PUT", "Bearish Flip 🔴"
 
-                    # --- 2. ENGULFING COLOR FLIP ---
-                    elif c1_close < c1_open and c0_close > c0_open and c0_close > (c1_open + c1_close)/2:
-                        direction, logic_name = "CALL", "Bullish Color Flip 🟢"
-                    elif c1_close > c1_open and c0_close < c0_open and c0_close < (c1_open + c1_close)/2:
-                        direction, logic_name = "PUT", "Bearish Color Flip 🔴"
-
-                    # --- 3. TWO-CANDLE MOMENTUM PUSH ---
-                    elif c0_close > c0_open and c1_close > c1_open and (u_wick0 / rng0) < 0.15:
-                        direction, logic_name = "CALL", "Bullish Momentum Push ⚡"
-                    elif c0_close < c0_open and c1_close < c1_open and (l_wick0 / rng0) < 0.15:
-                        direction, logic_name = "PUT", "Bearish Momentum Push ⚡"
-
-                    # --- 4. ZIG-ZAG ALTERNATING FLIP ---
-                    elif c2_close < c2_open and c1_close > c1_open and c0_close < c0_open:
-                        direction, logic_name = "CALL", "Zig-Zag Pattern Flip 🔄"
-                    elif c2_close > c2_open and c1_close < c1_open and c0_close > c0_open:
-                        direction, logic_name = "PUT", "Zig-Zag Pattern Flip 🔄"
-
-                    # কোলডাউন: একই পেয়ারে ২ মিনিটের আগে বারবার দেবে না
-                    if direction and (time.time() - last_signal_time.get(ticker, 0) > 90):
-                        send_telegram_signal(ticker, direction, logic_name, next_candle_time)
+                    if direction and (time.time() - last_signal_time.get(ticker, 0) > 120):
+                        pair = ticker.replace('=X','')
+                        emoji = "🟢 CALL (BUY)" if direction == "CALL" else "🔴 PUT (SELL)"
+                        
+                        alert = f"""
+🚨 *PREDICTIVE SIGNAL* 🚨
+--------------------------
+📊 Asset: `{pair}`
+🎯 Action: **{emoji}**
+⏳ Start: `{next_time}`
+⏰ Expiry: 1 MINUTE
+💡 Logic: `{pattern}`
+--------------------------
+👑 *TB Master Engine*
+"""
+                        send_msg(alert)
                         last_signal_time[ticker] = time.time()
-
                 except: continue
 
-            time.sleep(6) # প্রতি ৬ সেকেন্ডে স্ক্যান
+            time.sleep(10)
         except Exception as e:
+            print(f"Main Loop Error: {e}")
             time.sleep(10)
 
 if __name__ == "__main__":
