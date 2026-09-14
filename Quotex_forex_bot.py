@@ -3,102 +3,103 @@ import requests
 import time
 import os
 import threading
+import pandas as pd
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# ================== RENDER KEEP-ALIVE ==================
+# --- RENDER KEEP-ALIVE SERVER ---
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"TB V22 WIN-LOSS Tracker Live")
+        self.wfile.write(b"TB V23 Result Tracker is Active!")
 
 def keep_alive():
     port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
 
-# ================== CONFIG ==================
+# --- CONFIGURATION ---
 TOKEN = "8958179212:AAGRaqegMW4WJS9KTz1MwaU5lh5wtui4HQ0"
-GROUP_ID = "-1003927083951"   # তোমার SuperGroup ID
+GROUP_ID = "-1003927083951" 
 
 TICKERS = [
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X",
     "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "EURGBP=X", "USDCHF=X"
 ]
 
-last_signal = {}
-pending = []   # সিগন্যাল সেভ করে WIN/LOSS চেকের জন্য
+last_signal_time = {}
+pending_results = []
 
-# ================== TELEGRAM ==================
-def tg_send(text, reply_to=None):
+# --- TELEGRAM SEND FUNCTION ---
+def send_tg(text, reply_to=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    data = {
-        "chat_id": GROUP_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": GROUP_ID, "text": text, "parse_mode": "Markdown"}
     if reply_to:
-        data["reply_to_message_id"] = reply_to
+        payload["reply_to_message_id"] = reply_to
     try:
-        r = requests.post(url, json=data, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
         if r.status_code == 200:
             return r.json()["result"]["message_id"]
-        print("TG Error:", r.text)
         return None
-    except Exception as e:
-        print("TG Exception:", e)
+    except:
         return None
 
-# ================== WIN / LOSS CHECKER ==================
+# --- WIN/LOSS CHECKER (Updated & Robust) ---
 def check_results():
-    global pending
+    global pending_results
     now = time.time()
-    keep = []
+    still_pending = []
 
-    for p in pending:
-        # 70 সেকেন্ডের আগে চেক করব না
-        if now - p["time"] < 70:
-            keep.append(p)
+    for item in pending_results:
+        # ৮৫ সেকেন্ড অপেক্ষা করব যেন ইয়াহু ডাটা আপডেট হয়
+        if now - item["sent_at"] < 85:
+            still_pending.append(item)
             continue
 
         try:
-            df = yf.download(p["ticker"], period="1d", interval="1m", progress=False).tail(3)
-            
-            # multi-index fix
+            # ডাটা ফেচিং
+            df = yf.download(item["ticker"], period="1d", interval="1m", progress=False).tail(5)
+            if df.empty: continue
+
+            # Multi-index হ্যান্ডলিং
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-            open_price = float(df["Open"].iloc[-2])
-            close_price = float(df["Close"].iloc[-2])
+            # ক্যান্ডেল অ্যানালাইসিস
+            c_open = float(df["Open"].iloc[-2])
+            c_close = float(df["Close"].iloc[-2])
 
-            actual = "CALL" if close_price > open_price else "PUT"
-            win = (actual == p["direction"])
+            actual_direction = "CALL" if c_close > c_open else "PUT"
+            is_win = (actual_direction == item["direction"])
 
-            if win:
-                reply = f"✅ *WIN*\nResult: `{actual}`\nPrediction was correct!"
+            if is_win:
+                status_text = f"✅ *WIN* \nAsset: {item['pair']}\nResult: {actual_direction} ✔️"
             else:
-                reply = f"❌ *LOSS*\nResult: `{actual}`\nPrediction was wrong."
+                status_text = f"❌ *LOSS* \nAsset: {item['pair']}\nResult: {actual_direction} ❌"
 
-            tg_send(reply, reply_to=p["msg_id"])
-            print(f"Result → {p['ticker']} → {'WIN' if win else 'LOSS'}")
+            send_tg(status_text, reply_to=item["msg_id"])
+            print(f"Result Sent: {item['pair']} -> {'WIN' if is_win else 'LOSS'}")
 
         except Exception as e:
-            print("Result check error:", e)
+            print(f"Error checking result for {item['pair']}: {e}")
 
-    pending = keep
+    pending_results = still_pending
 
-# ================== SIGNAL LOGIC ==================
-def scan():
+# --- MARKET SCANNER ---
+def scan_market():
     try:
         data = yf.download(TICKERS, period="1d", interval="1m", progress=False).tail(5)
         now = datetime.now()
-
-        next_m = (now.minute + 1) % 60
-        next_h = now.hour if next_m != 0 else (now.hour + 1) % 24
-        next_time = f"{next_h:02d}:{next_m:02d}:00"
+        
+        # টাইম ক্যালকুলেশন
+        next_min = (now.minute + 1) % 60
+        next_hour = now.hour if next_min != 0 else (now.hour + 1) % 24
+        next_time = f"{next_hour:02d}:{next_min:02d}:00 UTC"
 
         for ticker in TICKERS:
             try:
+                # ডাটা এক্সট্রাকশন
                 c = data["Close"][ticker]
                 o = data["Open"][ticker]
                 h = data["High"][ticker]
@@ -109,77 +110,52 @@ def scan():
                 hi, lo = float(h.iloc[-1]), float(l.iloc[-1])
 
                 rng = max(hi - lo, 0.00001)
-                lw = min(o0, c0) - lo
-                uw = hi - max(o0, c0)
+                lw, uw = (min(o0, c0) - lo), (hi - max(o0, c0))
 
-                direction = None
-                logic = ""
+                direction, logic = None, ""
 
-                # 1. Red Reversal → Next Green (CALL)
-                if c0 < o0 and (lw / rng) > 0.35:
-                    direction, logic = "CALL", "Red Reversal → Next Green"
+                # --- প্যাটান লজিক ---
+                if c0 < o0 and (lw / rng) > 0.35: direction, logic = "CALL", "Buyer Rejection"
+                elif c0 > o0 and (uw / rng) > 0.35: direction, logic = "PUT", "Seller Rejection"
+                elif c1 < o1 and c0 > o0 and c0 > o1: direction, logic = "CALL", "Bullish Flip"
+                elif c1 > o1 and c0 < o0 and c0 < o1: direction, logic = "PUT", "Bearish Flip"
 
-                # 2. Green Reversal → Next Red (PUT)
-                elif c0 > o0 and (uw / rng) > 0.35:
-                    direction, logic = "PUT", "Green Reversal → Next Red"
-
-                # 3. Red → Green Flip
-                elif c1 < o1 and c0 > o0 and c0 > o1:
-                    direction, logic = "CALL", "Red-to-Green Flip"
-
-                # 4. Green → Red Flip
-                elif c1 > o1 and c0 < o0 and c0 < o1:
-                    direction, logic = "PUT", "Green-to-Red Flip"
-
-                # 5. Green Continuation
-                elif c0 > o0 and c1 > o1 and (uw / rng) < 0.15:
-                    direction, logic = "CALL", "Green Continuation"
-
-                # 6. Red Continuation
-                elif c0 < o0 and c1 < o1 and (lw / rng) < 0.15:
-                    direction, logic = "PUT", "Red Continuation"
-
-                if direction and (time.time() - last_signal.get(ticker, 0) > 90):
+                if direction and (time.time() - last_signal_time.get(ticker, 0) > 120):
                     pair = ticker.replace("=X", "")
                     emoji = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
-
-                    text = f"""🚨 *NEXT CANDLE SIGNAL*
+                    
+                    msg_text = f"""🚨 *NEXT CANDLE PREDICTION*
 ---------------------------
 📊 Asset: `{pair}`
 🎯 Next Candle: **{emoji}**
 ⏳ Start: `{next_time}`
-⏰ Expiry: 1 MIN
 💡 Logic: `{logic}`
 ---------------------------
-⚠️ Enter at 00 second
-💡 1-Step Martingale if needed
-👑 TB V22"""
+👑 TB Master V23 Pro"""
 
-                    msg_id = tg_send(text)
+                    msg_id = send_tg(msg_text)
                     if msg_id:
-                        pending.append({
+                        pending_results.append({
                             "ticker": ticker,
+                            "pair": pair,
                             "direction": direction,
                             "msg_id": msg_id,
-                            "time": time.time()
+                            "sent_at": time.time()
                         })
-                        last_signal[ticker] = time.time()
-                        print(f"Signal sent: {pair} → {direction}")
+                        last_signal_time[ticker] = time.time()
 
-            except:
-                continue
-    except Exception as e:
-        print("Scan error:", e)
+            except: continue
+    except: pass
 
-# ================== MAIN ==================
+# --- MAIN ENGINE ---
 def main():
     threading.Thread(target=keep_alive, daemon=True).start()
-    tg_send("🔮 *TB V22 WIN-LOSS Tracker Online!*\nBot will now reply WIN or LOSS under every signal.")
+    send_tg("🔮 *TB V23 Tracker Online!* \nBot will now reply WIN/LOSS after every candle.")
 
     while True:
-        scan()
+        scan_market()
         check_results()
-        time.sleep(8)
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
