@@ -3,6 +3,22 @@ import requests
 import time
 import pandas as pd
 from datetime import datetime
+import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# --- DUMMY WEB SERVER FOR RENDER FREE TIER ---
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Target Billionaire Engine is Running 24/7 Free!")
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
+    print(f"Web server running on port {port}")
+    server.serve_forever()
 
 # --- CONFIGURATION ---
 TOKEN = "8958179212:AAGRaqegMW4WJS9KTz1MwaU5lh5wtui4HQ0"
@@ -57,7 +73,6 @@ def analyze_pair(pair_name, ticker):
         if isinstance(df.columns, pd.MultiIndex): 
             df.columns = df.columns.get_level_values(0)
 
-        # Bollinger Bands Calc
         df['Upper'], df['Lower'] = calculate_bollinger_bands(df)
         
         c = df.iloc[-1]
@@ -66,14 +81,7 @@ def analyze_pair(pair_name, ticker):
         c_open, c_close = c['Open'], c['Close']
         c_high, c_low = c['High'], c['Low']
         
-        # --- LOGIC: BOLLINGER STRETCH REVERSAL ---
-        
-        # BUY (CALL) Condition:
-        # Prev or Current candle touched/closed BELOW Lower Band + Bullish Rejection/Engulfing
         call_cond = (c_low < c['Lower'] or prev['Low'] < prev['Lower']) and (c_close > c_open)
-
-        # SELL (PUT) Condition:
-        # Prev or Current candle touched/closed ABOVE Upper Band + Bearish Rejection/Engulfing
         put_cond = (c_high > c['Upper'] or prev['High'] > prev['Upper']) and (c_close < c_open)
 
         curr_t = time.time()
@@ -86,7 +94,10 @@ def analyze_pair(pair_name, ticker):
         print(f"Scan Error {pair_name}: {e}")
 
 def main():
-    print("🚀 1-Min Bollinger Reversal Engine Active...")
+    # Start Keep-Alive Web Server Thread
+    threading.Thread(target=run_web_server, daemon=True).start()
+    print("🚀 1-Min Cloud Engine Active...")
+    
     while True:
         for pair_name, ticker in PAIRS.items():
             analyze_pair(pair_name, ticker)
